@@ -30,6 +30,7 @@ struct Brick {
     Color color{WHITE};
     int row{0};
     int col{0};
+    int colorIndex{-1};
 };
 
 constexpr int ScreenWidth = 960;
@@ -50,6 +51,7 @@ constexpr Color BrickPalette[] = {
 constexpr int BrickPaletteCount = sizeof(BrickPalette) / sizeof(Color);
 constexpr int ColorIndexRed = 0;
 constexpr int ColorIndexPurple = 3;
+constexpr int ColorIndexGreen = 2;
 constexpr float OverloadAoEDelay = 0.18f;
 
 struct OverloadEvent {
@@ -83,15 +85,18 @@ std::vector<Brick> CreateBricks() {
             float x = BrickSpacing + col * (brickWidth + BrickSpacing);
             float y = BrickTopOffset + row * (BrickHeight + BrickSpacing);
 
-            Color color = BrickPalette[(row * BrickCols + col) % BrickPaletteCount];
+            int colorIdx = (row * BrickCols + col) % BrickPaletteCount;
+            Color color = BrickPalette[colorIdx];
             if (row == BrickRows - 1) {
-                color = BrickPalette[col % BrickPaletteCount];
+                colorIdx = col % BrickPaletteCount;
+                color = BrickPalette[colorIdx];
             }
 
             bool hasGap = GetRandomValue(0, 99) < 28; // 28% chance to skip a brick
 
             if (!hasGap && GetRandomValue(0, 99) < 15) { // 15% chance for neutral white brick
                 color = WHITE;
+                colorIdx = -1;
             }
 
             bricks.push_back(Brick{
@@ -100,6 +105,7 @@ std::vector<Brick> CreateBricks() {
                 .color = color,
                 .row = row,
                 .col = col,
+                .colorIndex = colorIdx,
             });
         }
     }
@@ -303,6 +309,18 @@ int HandleBallBrickCollision(Ball& ball, std::vector<Brick>& bricks, Vector2 pre
                     ball.position.y = brick.rect.y - ball.radius;
                 }
             }
+        }
+
+        bool triggeredSwirl = (ball.colorIndex == ColorIndexGreen) &&
+                              (brick.colorIndex != ColorIndexGreen) &&
+                              (brick.colorIndex != -1);
+
+        if (triggeredSwirl) {
+            overloadEvents.push_back(OverloadEvent{
+                .row = brick.row,
+                .col = brick.col,
+                .timer = OverloadAoEDelay,
+            });
         }
 
         if (ball.overloaded) {
