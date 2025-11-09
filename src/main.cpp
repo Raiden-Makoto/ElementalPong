@@ -7,6 +7,7 @@
 #include <queue>
 #include <string>
 #include <vector>
+#include <sstream>
 
 struct Paddle {
     Rectangle rect{};
@@ -68,6 +69,43 @@ constexpr int ColorIndexLightBlue = 4;
 constexpr int ColorIndexGreen = 2;
 constexpr float OverloadAoEDelay = 0.18f;
 constexpr float SurgeChainStepDelay = 0.08f;
+
+Sound gBounceSound{};
+Sound gGameOverSound{};
+bool gAudioReady = false;
+std::vector<std::string> gHelpWrappedLines;
+float gHelpWrapWidth = 0.0f;
+
+static const char* HelpLines[] = {
+    "Elemental Breakout - How to Play",
+    "",
+    "Controls",
+    "  - Left / Right or A / D: Move paddle",
+    "  - Space: Launch ball",
+    "  - Enter: Start a new wave / continue",
+    "  - Q: Forfeit run",
+    "  - 1-5: Change paddle element",
+    "  - P: Pause",
+    "",
+    "Elemental Reactions",
+    "  - Overloaded (Purple + Red paddle): Ball supercharges, next brick causes an AoE explosion.",
+    "  - Swirl (Green ball + non-green brick): Spreads the new element to nearby bricks.",
+    "  - Freeze (Blue + Light Blue paddle): Ball freezes on paddle, next brick freezes connected cluster.",
+    "  - Melt (Red ball + Frozen brick): Thaws the brick back to yellow.",
+    "  - Vaporize (Blue ball + Red brick): Instantly destroys the brick.",
+    "  - Liquefy (Light Blue ball + Red brick): Converts the brick to blue.",
+    "  - Superconduct (Purple + Light Blue paddle): Ball phases through bricks.",
+    "  - Surge (Purple ball + Blue brick, or Blue ball + Purple brick): Lightning arc clears diagonal lines.",
+    "  - Infuse (Any non-green ball + Green brick): Converts adjacent green bricks to the ball's element.",
+    "  - Frozen clusters shattered by other colors chain-break neighboring frozen bricks.",
+    "",
+    "Progression",
+    "  - Clearing all bricks spawns a fresh wave and increases ball speed by 15%.",
+    "  - You have one life; falling off the screen ends the run.",
+    "",
+    "Press Enter or Space to begin!",
+};
+constexpr int HelpLineCount = sizeof(HelpLines) / sizeof(HelpLines[0]);
 
 Color LightenColor(Color color, float factor) {
     auto lightenChannel = [factor](unsigned char channel) -> unsigned char {
@@ -377,6 +415,38 @@ std::vector<Brick> CreateBricks() {
     return bricks;
 }
 
+std::vector<std::string> WrapHelpLines(float maxWidth, int fontSize) {
+    std::vector<std::string> wrapped;
+    wrapped.reserve(HelpLineCount * 2);
+
+    for (int i = 0; i < HelpLineCount; ++i) {
+        const std::string line = HelpLines[i];
+        if (line.empty()) {
+            wrapped.emplace_back("");
+            continue;
+        }
+
+        std::istringstream iss(line);
+        std::string word;
+        std::string current;
+        while (iss >> word) {
+            std::string candidate = current.empty() ? word : current + " " + word;
+            if (!current.empty() && MeasureText(candidate.c_str(), fontSize) > maxWidth) {
+                wrapped.push_back(current);
+                current = word;
+            } else {
+                current = candidate;
+            }
+        }
+
+        if (!current.empty()) {
+            wrapped.push_back(current);
+        }
+    }
+
+    return wrapped;
+}
+
 int ApplyOverloadedAoE(std::vector<Brick>& bricks, int centerRow, int centerCol) {
     int removed = 0;
     for (Brick& brick : bricks) {
@@ -477,17 +547,25 @@ void UpdatePaddle(Paddle& paddle, float dt) {
 }
 
 void HandleBallWallCollisions(Ball& ball) {
+    bool bounced = false;
     if (ball.position.x - ball.radius <= 0.0f) {
         ball.position.x = ball.radius;
         ball.velocity.x *= -1.0f;
+        bounced = true;
     } else if (ball.position.x + ball.radius >= ScreenWidth) {
         ball.position.x = ScreenWidth - ball.radius;
         ball.velocity.x *= -1.0f;
+        bounced = true;
     }
 
     if (ball.position.y - ball.radius <= 0.0f) {
         ball.position.y = ball.radius;
         ball.velocity.y *= -1.0f;
+        bounced = true;
+    }
+
+    if (bounced && gAudioReady) {
+        PlaySound(gBounceSound);
     }
 }
 
@@ -537,6 +615,9 @@ bool HandleBallPaddleCollision(Ball& ball, const Paddle& paddle) {
         ball.storedVelocity = {};
     }
     ball.vaporizeReady = false;
+    if (gAudioReady) {
+        PlaySound(gBounceSound);
+    }
     return true;
 }
 
@@ -566,6 +647,8 @@ int HandleBallBrickCollision(Ball& ball, std::vector<Brick>& bricks, Vector2 pre
             ball.freezeReady = false;
         }
 
+        bool brickBounced = false;
+
         if (!ball.superconduct) {
             bool collidedFromLeft = previousPosition.x + ball.radius <= brick.rect.x;
             bool collidedFromRight = previousPosition.x - ball.radius >= brick.rect.x + brick.rect.width;
@@ -582,6 +665,7 @@ int HandleBallBrickCollision(Ball& ball, std::vector<Brick>& bricks, Vector2 pre
                     ball.position.x = brick.rect.x + brick.rect.width + ball.radius;
                 }
                 resolved = true;
+                brickBounced = true;
             }
 
             if (!resolved && (collidedFromTop || collidedFromBottom)) {
@@ -592,6 +676,7 @@ int HandleBallBrickCollision(Ball& ball, std::vector<Brick>& bricks, Vector2 pre
                     ball.position.y = brick.rect.y + brick.rect.height + ball.radius;
                 }
                 resolved = true;
+                brickBounced = true;
             }
 
             if (!resolved) {
@@ -607,6 +692,7 @@ int HandleBallBrickCollision(Ball& ball, std::vector<Brick>& bricks, Vector2 pre
                     } else {
                         ball.position.x = brick.rect.x - ball.radius;
                     }
+                    brickBounced = true;
                 } else {
                     ball.velocity.y *= -1.0f;
                     if (diffY > 0.0f) {
@@ -614,8 +700,13 @@ int HandleBallBrickCollision(Ball& ball, std::vector<Brick>& bricks, Vector2 pre
                     } else {
                         ball.position.y = brick.rect.y - ball.radius;
                     }
+                    brickBounced = true;
                 }
             }
+        }
+
+        if (brickBounced && gAudioReady) {
+            PlaySound(gBounceSound);
         }
 
         bool triggeredSwirl = (ball.colorIndex == ColorIndexGreen) &&
@@ -753,6 +844,12 @@ void HandlePaddleColorInput(Paddle& paddle) {
 int main() {
     SetRandomSeed(static_cast<unsigned int>(std::time(nullptr)));
     InitWindow(ScreenWidth, ScreenHeight, "Elemental Breakout");
+    InitAudioDevice();
+    gAudioReady = IsAudioDeviceReady();
+    if (gAudioReady) {
+        gBounceSound = LoadSound("sounds/bounce.mp3");
+        gGameOverSound = LoadSound("sounds/gameover.mp3");
+    }
     SetTargetFPS(60);
 
     Paddle paddle{{ScreenWidth / 2.0f - 60.0f, ScreenHeight - 80.0f, 120.0f, 20.0f}};
@@ -773,9 +870,73 @@ int main() {
     bool gameWon = false;
     bool gameOver = false;
     bool paused = false;
+    bool gameOverSoundPlayed = false;
+    bool showHowTo = true;
+    float howToScroll = 0.0f;
 
     while (!WindowShouldClose()) {
         float dt = GetFrameTime();
+
+        if (showHowTo) {
+            float wheel = GetMouseWheelMove();
+            howToScroll += wheel * -48.0f;
+            if (IsKeyDown(KEY_DOWN)) {
+                howToScroll += 180.0f * dt;
+            }
+            if (IsKeyDown(KEY_UP)) {
+                howToScroll -= 180.0f * dt;
+            }
+            BeginDrawing();
+            ClearBackground(BLACK);
+            DrawText("Elemental Breakout", ScreenWidth / 2 - MeasureText("Elemental Breakout", 48) / 2, 40, 48, WHITE);
+
+            Rectangle panelRect{60.0f, 80.0f, static_cast<float>(ScreenWidth - 120), static_cast<float>(ScreenHeight - 160)};
+            DrawRectangleRounded(panelRect, 0.1f, 8, Fade(BLACK, 0.85f));
+            DrawRectangleRoundedLines(panelRect, 0.1f, 8, Fade(WHITE, 0.4f));
+
+            const int fontSize = 22;
+            const int lineSpacing = 28;
+            float usableWidth = panelRect.width - 80.0f;
+            if (gHelpWrappedLines.empty() || std::fabs(gHelpWrapWidth - usableWidth) > 1.0f) {
+                gHelpWrappedLines = WrapHelpLines(usableWidth, fontSize);
+                gHelpWrapWidth = usableWidth;
+            }
+
+            int availableHeight = static_cast<int>(panelRect.height) - 80;
+            int totalHeight = static_cast<int>(gHelpWrappedLines.size()) * lineSpacing;
+            if (totalHeight < availableHeight) {
+                howToScroll = 0.0f;
+            } else {
+                float maxScroll = static_cast<float>(totalHeight - availableHeight);
+                if (howToScroll < 0.0f) howToScroll = 0.0f;
+                if (howToScroll > maxScroll) howToScroll = maxScroll;
+            }
+
+            int baseY = static_cast<int>(panelRect.y) + 40;
+            for (size_t i = 0; i < gHelpWrappedLines.size(); ++i) {
+                int drawY = baseY + i * lineSpacing - static_cast<int>(howToScroll);
+                if (drawY < panelRect.y + 30 || drawY > panelRect.y + panelRect.height - 50) {
+                    continue;
+                }
+                Color lineColor = (i == 0) ? YELLOW : LIGHTGRAY;
+                DrawText(gHelpWrappedLines[i].c_str(), static_cast<int>(panelRect.x) + 40, drawY, fontSize, lineColor);
+            }
+
+            int hintY = static_cast<int>(panelRect.y + panelRect.height) + 20;
+            const char* hintScroll = "Mouse wheel / Arrow keys to scroll";
+            const char* hintStart = "Press Enter or Space to start";
+            DrawText(hintScroll, ScreenWidth / 2 - MeasureText(hintScroll, 20) / 2, hintY, 20, GRAY);
+            DrawText(hintStart, ScreenWidth / 2 - MeasureText(hintStart, 20) / 2, hintY + 28, 20, GRAY);
+
+            if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_SPACE)) {
+                showHowTo = false;
+                howToScroll = 0.0f;
+                ResetBallOnPaddle(ball, paddle);
+            }
+
+            EndDrawing();
+            continue;
+        }
 
         if (!gameOver && !gameWon && IsKeyPressed(KEY_P)) {
             paused = !paused;
@@ -810,17 +971,23 @@ int main() {
             ball.position.y = paddle.rect.y - ball.radius - 1.0f;
         }
 
-        if (!paused && !gameOver && !gameWon && IsKeyPressed(KEY_SPACE)) {
+        bool canAct = !paused && !gameOver && !gameWon;
+
+        if (canAct && IsKeyPressed(KEY_SPACE)) {
             LaunchBall(ball);
         }
 
-        if (!paused && !gameOver && !gameWon && IsKeyPressed(KEY_Q)) {
+        if (canAct && IsKeyPressed(KEY_Q)) {
             lives = 0;
             gameOver = true;
             ball.inPlay = false;
+            if (!gameOverSoundPlayed && gAudioReady) {
+                PlaySound(gGameOverSound);
+                gameOverSoundPlayed = true;
+            }
         }
 
-        if (!paused && ball.inPlay && !gameOver && !gameWon && !ball.frozen) {
+        if (canAct && ball.inPlay && !ball.frozen) {
             Vector2 previousPosition = ball.position;
             ball.position = {
                 ball.position.x + ball.velocity.x * dt,
@@ -851,12 +1018,17 @@ int main() {
                 ResetBallOnPaddle(ball, paddle);
                 reactionEvents.clear();
                 reactionMessage.active = false;
+                gameOverSoundPlayed = false;
             }
 
             if (ball.position.y - ball.radius > ScreenHeight) {
                 lives -= 1;
                 if (lives <= 0) {
                     gameOver = true;
+                    if (!gameOverSoundPlayed && gAudioReady) {
+                        PlaySound(gGameOverSound);
+                        gameOverSoundPlayed = true;
+                    }
                 }
                 ResetBallOnPaddle(ball, paddle);
             }
@@ -866,10 +1038,15 @@ int main() {
             int extraRemoved = ResolveReactionEvents(dt, reactionEvents, bricks);
             if (extraRemoved > 0) {
                 score += extraRemoved;
-                if (CountActiveBricks(bricks) == 0) {
-                    gameWon = true;
-                    ball.inPlay = false;
-                }
+            }
+            if (CountActiveBricks(bricks) == 0) {
+                bricks = CreateBricks();
+                ball.speed *= 1.15f;
+                ball.inPlay = false;
+                ResetBallOnPaddle(ball, paddle);
+                reactionEvents.clear();
+                reactionMessage.active = false;
+                gameOverSoundPlayed = false;
             }
         }
 
@@ -884,9 +1061,10 @@ int main() {
             ResetBallOnPaddle(ball, paddle);
             paddle.rect.x = ScreenWidth / 2.0f - paddle.rect.width * 0.5f;
             paddle.rect.y = ScreenHeight - 80.0f;
+            gameOverSoundPlayed = false;
         }
 
-        BeginDrawing();
+    BeginDrawing();
         ClearBackground(BLACK);
 
         DrawText("Elemental Breakout", ScreenWidth / 2 - MeasureText("Elemental Breakout", 32) / 2, 24, 32, WHITE);
@@ -929,6 +1107,11 @@ int main() {
         EndDrawing();
     }
 
+    if (gAudioReady) {
+        UnloadSound(gBounceSound);
+        UnloadSound(gGameOverSound);
+        CloseAudioDevice();
+    }
     CloseWindow();
     return 0;
 }
