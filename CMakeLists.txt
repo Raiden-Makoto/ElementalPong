@@ -7,7 +7,12 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 find_package(raylib CONFIG REQUIRED)
 
-add_executable(elemental_pong src/main.cpp)
+add_executable(elemental_pong
+    src/main.cpp
+    src/AudioManager.cpp
+    src/InstructionsScreen.cpp
+    src/ElementalGame.cpp
+)
 target_link_libraries(elemental_pong PRIVATE raylib)
 
 if (APPLE)
