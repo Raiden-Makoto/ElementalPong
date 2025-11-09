@@ -21,12 +21,15 @@ struct Ball {
     bool inPlay{false};
     Color color{WHITE};
     int colorIndex{0};
+    bool overloaded{false};
 };
 
 struct Brick {
     Rectangle rect{};
     bool active{true};
     Color color{WHITE};
+    int row{0};
+    int col{0};
 };
 
 constexpr int ScreenWidth = 960;
@@ -45,6 +48,15 @@ constexpr Color BrickPalette[] = {
     {173, 216, 230, 255}, // light blue/white
 };
 constexpr int BrickPaletteCount = sizeof(BrickPalette) / sizeof(Color);
+constexpr int ColorIndexRed = 0;
+constexpr int ColorIndexPurple = 3;
+constexpr float OverloadAoEDelay = 0.18f;
+
+struct OverloadEvent {
+    int row;
+    int col;
+    float timer;
+};
 
 Vector2 Normalize(Vector2 v) {
     float lengthSq = v.x * v.x + v.y * v.y;
@@ -86,6 +98,8 @@ std::vector<Brick> CreateBricks() {
                 .rect = {x, y, brickWidth, BrickHeight},
                 .active = !hasGap,
                 .color = color,
+                .row = row,
+                .col = col,
             });
         }
     }
@@ -93,8 +107,53 @@ std::vector<Brick> CreateBricks() {
     return bricks;
 }
 
+int ApplyOverloadedAoE(std::vector<Brick>& bricks, int centerRow, int centerCol) {
+    int removed = 0;
+    for (Brick& brick : bricks) {
+        if (!brick.active) {
+            continue;
+        }
+        int dRow = std::abs(brick.row - centerRow);
+        int dCol = std::abs(brick.col - centerCol);
+        if (dRow <= 1 && dCol <= 1) {
+            brick.active = false;
+            removed += 1;
+        }
+    }
+    return removed;
+}
+
+int CountActiveBricks(const std::vector<Brick>& bricks) {
+    int active = 0;
+    for (const Brick& brick : bricks) {
+        if (brick.active) {
+            active += 1;
+        }
+    }
+    return active;
+}
+
+int ResolveOverloadEvents(float dt, std::vector<OverloadEvent>& events, std::vector<Brick>& bricks) {
+    int removed = 0;
+    for (OverloadEvent& event : events) {
+        event.timer -= dt;
+    }
+
+    auto it = events.begin();
+    while (it != events.end()) {
+        if (it->timer <= 0.0f) {
+            removed += ApplyOverloadedAoE(bricks, it->row, it->col);
+            it = events.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    return removed;
+}
+
 void ResetBallOnPaddle(Ball& ball, const Paddle& paddle) {
     ball.inPlay = false;
+    ball.overloaded = false;
     ball.position = {
         paddle.rect.x + paddle.rect.width * 0.5f,
         paddle.rect.y - ball.radius - 1.0f,
@@ -163,10 +222,14 @@ bool HandleBallPaddleCollision(Ball& ball, const Paddle& paddle) {
     Vector2 direction{relative, -1.0f};
     direction = Normalize(direction);
     ball.velocity = Scale(direction, ball.speed);
+
+    bool overloadedTrigger = (ball.colorIndex == ColorIndexPurple && paddle.colorIndex == ColorIndexRed) ||
+                             (ball.colorIndex == ColorIndexRed && paddle.colorIndex == ColorIndexPurple);
+    ball.overloaded = overloadedTrigger;
     return true;
 }
 
-int HandleBallBrickCollision(Ball& ball, std::vector<Brick>& bricks, Vector2 previousPosition) {
+int HandleBallBrickCollision(Ball& ball, std::vector<Brick>& bricks, Vector2 previousPosition, std::vector<OverloadEvent>& overloadEvents) {
     if (!ball.inPlay) {
         return 0;
     }
@@ -233,6 +296,15 @@ int HandleBallBrickCollision(Ball& ball, std::vector<Brick>& bricks, Vector2 pre
             }
         }
 
+        if (ball.overloaded) {
+            overloadEvents.push_back(OverloadEvent{
+                .row = brick.row,
+                .col = brick.col,
+                .timer = OverloadAoEDelay,
+            });
+            ball.overloaded = false;
+        }
+
         break;
     }
     return bricksBroken;
@@ -262,15 +334,16 @@ int main() {
     SetTargetFPS(60);
 
     Paddle paddle{{ScreenWidth / 2.0f - 60.0f, ScreenHeight - 80.0f, 120.0f, 20.0f}};
-    paddle.colorIndex = GetRandomValue(0, BrickPaletteCount - 1);
+    paddle.colorIndex = ColorIndexPurple;
     paddle.color = BrickPalette[paddle.colorIndex];
 
     Ball ball{};
-    ball.colorIndex = GetRandomValue(0, BrickPaletteCount - 1);
+    ball.colorIndex = ColorIndexRed;
     ball.color = BrickPalette[ball.colorIndex];
     ResetBallOnPaddle(ball, paddle);
 
     std::vector<Brick> bricks = CreateBricks();
+    std::vector<OverloadEvent> overloadEvents;
 
     int score = 0;
     int lives = 3;
@@ -315,14 +388,9 @@ int main() {
 
             HandleBallWallCollisions(ball);
             HandleBallPaddleCollision(ball, paddle);
-            score += HandleBallBrickCollision(ball, bricks, previousPosition);
+            score += HandleBallBrickCollision(ball, bricks, previousPosition, overloadEvents);
 
-            int activeBricks = 0;
-            for (const Brick& brick : bricks) {
-                if (brick.active) {
-                    activeBricks += 1;
-                }
-            }
+            int activeBricks = CountActiveBricks(bricks);
 
             if (activeBricks == 0) {
                 gameWon = true;
@@ -335,6 +403,17 @@ int main() {
                     gameOver = true;
                 }
                 ResetBallOnPaddle(ball, paddle);
+            }
+        }
+
+        if (!paused && !gameOver && !gameWon) {
+            int extraRemoved = ResolveOverloadEvents(dt, overloadEvents, bricks);
+            if (extraRemoved > 0) {
+                score += extraRemoved;
+                if (CountActiveBricks(bricks) == 0) {
+                    gameWon = true;
+                    ball.inPlay = false;
+                }
             }
         }
 
