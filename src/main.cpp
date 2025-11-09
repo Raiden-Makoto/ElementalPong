@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <cmath>
 #include <ctime>
+#include <queue>
+#include <string>
 #include <vector>
 
 struct Paddle {
@@ -22,15 +24,24 @@ struct Ball {
     Color color{WHITE};
     int colorIndex{0};
     bool overloaded{false};
+    bool superconduct{false};
+    bool frozen{false};
+    bool freezeReady{false};
+    float freezeTimer{0.0f};
+    Vector2 storedVelocity{};
 };
 
 struct Brick {
     Rectangle rect{};
     bool active{true};
+    Color baseColor{WHITE};
     Color color{WHITE};
     int row{0};
     int col{0};
     int colorIndex{-1};
+    int hitPoints{2};
+    bool cracked{false};
+    bool frozen{false};
 };
 
 constexpr int ScreenWidth = 960;
@@ -50,15 +61,110 @@ constexpr Color BrickPalette[] = {
 };
 constexpr int BrickPaletteCount = sizeof(BrickPalette) / sizeof(Color);
 constexpr int ColorIndexRed = 0;
+constexpr int ColorIndexBlue = 1;
 constexpr int ColorIndexPurple = 3;
+constexpr int ColorIndexLightBlue = 4;
 constexpr int ColorIndexGreen = 2;
 constexpr float OverloadAoEDelay = 0.18f;
+
+Color LightenColor(Color color, float factor) {
+    auto lightenChannel = [factor](unsigned char channel) -> unsigned char {
+        int value = static_cast<int>(channel + (255 - channel) * factor);
+        value = std::clamp(value, 0, 255);
+        return static_cast<unsigned char>(value);
+    };
+
+    return Color{
+        lightenChannel(color.r),
+        lightenChannel(color.g),
+        lightenChannel(color.b),
+        color.a
+    };
+}
+
+Brick* GetBrickAt(std::vector<Brick>& bricks, int row, int col) {
+    for (Brick& brick : bricks) {
+        if (brick.row == row && brick.col == col) {
+            return &brick;
+        }
+    }
+    return nullptr;
+}
+
+int FreezeConnectedBricks(std::vector<Brick>& bricks, int startRow, int startCol, int targetColorIndex) {
+    if (targetColorIndex < 0) {
+        return 0;
+    }
+
+    int frozenCount = 0;
+    bool visited[BrickRows][BrickCols] = {};
+    std::queue<std::pair<int, int>> toVisit;
+    toVisit.emplace(startRow, startCol);
+
+    const std::pair<int, int> directions[] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+
+    while (!toVisit.empty()) {
+        auto [row, col] = toVisit.front();
+        toVisit.pop();
+
+        if (row < 0 || row >= BrickRows || col < 0 || col >= BrickCols) {
+            continue;
+        }
+        if (visited[row][col]) {
+            continue;
+        }
+        visited[row][col] = true;
+
+        Brick* brick = GetBrickAt(bricks, row, col);
+        if (brick == nullptr || !brick->active || brick->colorIndex != targetColorIndex) {
+            continue;
+        }
+
+        brick->baseColor = WHITE;
+        brick->color = WHITE;
+        brick->colorIndex = -1;
+        brick->cracked = false;
+        brick->hitPoints = 1;
+        brick->frozen = true;
+        frozenCount += 1;
+
+        for (const auto& dir : directions) {
+            toVisit.emplace(row + dir.first, col + dir.second);
+        }
+    }
+
+    return frozenCount;
+}
 
 struct OverloadEvent {
     int row;
     int col;
     float timer;
 };
+
+struct ReactionMessage {
+    std::string text{};
+    Color color{WHITE};
+    float timer{0.0f};
+    bool active{false};
+};
+
+void ShowReactionMessage(ReactionMessage& message, const std::string& text, Color color, float duration = 1.2f) {
+    message.text = text;
+    message.color = color;
+    message.timer = duration;
+    message.active = true;
+}
+
+void UpdateReactionMessage(ReactionMessage& message, float dt) {
+    if (!message.active) {
+        return;
+    }
+    message.timer -= dt;
+    if (message.timer <= 0.0f) {
+        message.active = false;
+    }
+}
 
 Vector2 Normalize(Vector2 v) {
     float lengthSq = v.x * v.x + v.y * v.y;
@@ -81,32 +187,50 @@ std::vector<Brick> CreateBricks() {
     float availableWidth = ScreenWidth - totalSpacingX;
     float brickWidth = availableWidth / BrickCols;
     for (int row = 0; row < BrickRows; ++row) {
-        for (int col = 0; col < BrickCols; ++col) {
-            float x = BrickSpacing + col * (brickWidth + BrickSpacing);
-            float y = BrickTopOffset + row * (BrickHeight + BrickSpacing);
-
-            int colorIdx = (row * BrickCols + col) % BrickPaletteCount;
-            Color color = BrickPalette[colorIdx];
-            if (row == BrickRows - 1) {
-                colorIdx = col % BrickPaletteCount;
-                color = BrickPalette[colorIdx];
+        int col = 0;
+        while (col < BrickCols) {
+            int remaining = BrickCols - col;
+            int chunkSize = GetRandomValue(3, 6);
+            if (chunkSize > remaining) {
+                chunkSize = remaining;
             }
 
-            bool hasGap = GetRandomValue(0, 99) < 28; // 28% chance to skip a brick
+            int colorIdx = GetRandomValue(0, BrickPaletteCount - 1);
+            Color chunkColor = BrickPalette[colorIdx];
 
-            if (!hasGap && GetRandomValue(0, 99) < 15) { // 15% chance for neutral white brick
-                color = WHITE;
+            bool chunkNeutral = GetRandomValue(0, 99) < 15;
+            Color neutralColor = {255, 221, 0, 255}; // yellow
+            if (chunkNeutral) {
                 colorIdx = -1;
+                chunkColor = neutralColor;
             }
 
-            bricks.push_back(Brick{
-                .rect = {x, y, brickWidth, BrickHeight},
-                .active = !hasGap,
-                .color = color,
-                .row = row,
-                .col = col,
-                .colorIndex = colorIdx,
-            });
+            for (int i = 0; i < chunkSize; ++i) {
+                int currentCol = col + i;
+                float x = BrickSpacing + currentCol * (brickWidth + BrickSpacing);
+                float y = BrickTopOffset + row * (BrickHeight + BrickSpacing);
+
+                bool hasGap = GetRandomValue(0, 99) < 28; // chance to skip individual brick
+
+                if (hasGap) {
+                    continue;
+                }
+
+                bricks.push_back(Brick{
+                    .rect = {x, y, brickWidth, BrickHeight},
+                    .active = true,
+                    .baseColor = chunkColor,
+                    .color = chunkColor,
+                    .row = row,
+                    .col = currentCol,
+                    .colorIndex = colorIdx,
+                    .hitPoints = 2,
+                    .cracked = false,
+                    .frozen = false,
+                });
+            }
+
+            col += chunkSize;
         }
     }
 
@@ -123,6 +247,9 @@ int ApplyOverloadedAoE(std::vector<Brick>& bricks, int centerRow, int centerCol)
         int dCol = std::abs(brick.col - centerCol);
         if (dRow <= 1 && dCol <= 1) {
             brick.active = false;
+            brick.hitPoints = 0;
+            brick.cracked = false;
+            brick.color = brick.baseColor;
             removed += 1;
         }
     }
@@ -160,6 +287,11 @@ int ResolveOverloadEvents(float dt, std::vector<OverloadEvent>& events, std::vec
 void ResetBallOnPaddle(Ball& ball, const Paddle& paddle) {
     ball.inPlay = false;
     ball.overloaded = false;
+    ball.superconduct = false;
+    ball.frozen = false;
+    ball.freezeReady = false;
+    ball.freezeTimer = 0.0f;
+    ball.storedVelocity = {};
     ball.colorIndex = -1;
     ball.color = WHITE;
     ball.position = {
@@ -233,6 +365,10 @@ bool HandleBallPaddleCollision(Ball& ball, const Paddle& paddle) {
 
     bool overloadedTrigger = (ball.colorIndex == ColorIndexPurple && paddle.colorIndex == ColorIndexRed) ||
                              (ball.colorIndex == ColorIndexRed && paddle.colorIndex == ColorIndexPurple);
+    bool superconductTrigger = (ball.colorIndex == ColorIndexPurple && paddle.colorIndex == ColorIndexLightBlue) ||
+                               (ball.colorIndex == ColorIndexLightBlue && paddle.colorIndex == ColorIndexPurple);
+    bool freezeTrigger = (ball.colorIndex == ColorIndexBlue && paddle.colorIndex == ColorIndexLightBlue) ||
+                         (ball.colorIndex == ColorIndexLightBlue && paddle.colorIndex == ColorIndexBlue);
     if (paddle.colorIndex >= 0 && paddle.colorIndex < BrickPaletteCount) {
         ball.colorIndex = paddle.colorIndex;
         ball.color = BrickPalette[ball.colorIndex];
@@ -241,10 +377,23 @@ bool HandleBallPaddleCollision(Ball& ball, const Paddle& paddle) {
         ball.color = WHITE;
     }
     ball.overloaded = overloadedTrigger;
+    ball.superconduct = superconductTrigger;
+    if (freezeTrigger) {
+        ball.freezeReady = true;
+        ball.frozen = true;
+        ball.freezeTimer = 2.0f;
+        ball.storedVelocity = ball.velocity;
+        ball.velocity = {0.0f, 0.0f};
+    } else {
+        ball.freezeReady = false;
+        ball.frozen = false;
+        ball.freezeTimer = 0.0f;
+        ball.storedVelocity = {};
+    }
     return true;
 }
 
-int HandleBallBrickCollision(Ball& ball, std::vector<Brick>& bricks, Vector2 previousPosition, std::vector<OverloadEvent>& overloadEvents) {
+int HandleBallBrickCollision(Ball& ball, std::vector<Brick>& bricks, Vector2 previousPosition, std::vector<OverloadEvent>& overloadEvents, ReactionMessage& reactionMessage) {
     if (!ball.inPlay) {
         return 0;
     }
@@ -258,55 +407,66 @@ int HandleBallBrickCollision(Ball& ball, std::vector<Brick>& bricks, Vector2 pre
             continue;
         }
 
-        brick.active = false;
-        bricksBroken += 1;
+        int freezeColorIndex = brick.colorIndex;
 
-        bool collidedFromLeft = previousPosition.x + ball.radius <= brick.rect.x;
-        bool collidedFromRight = previousPosition.x - ball.radius >= brick.rect.x + brick.rect.width;
-        bool collidedFromTop = previousPosition.y + ball.radius <= brick.rect.y;
-        bool collidedFromBottom = previousPosition.y - ball.radius >= brick.rect.y + brick.rect.height;
-
-        bool resolved = false;
-
-        if (collidedFromLeft || collidedFromRight) {
-            ball.velocity.x *= -1.0f;
-            if (collidedFromLeft) {
-                ball.position.x = brick.rect.x - ball.radius;
-            } else {
-                ball.position.x = brick.rect.x + brick.rect.width + ball.radius;
-            }
-            resolved = true;
-        }
-
-        if (!resolved && (collidedFromTop || collidedFromBottom)) {
-            ball.velocity.y *= -1.0f;
-            if (collidedFromTop) {
-                ball.position.y = brick.rect.y - ball.radius;
-            } else {
-                ball.position.y = brick.rect.y + brick.rect.height + ball.radius;
-            }
-            resolved = true;
-        }
-
-        if (!resolved) {
-            float brickCenterX = brick.rect.x + brick.rect.width * 0.5f;
-            float brickCenterY = brick.rect.y + brick.rect.height * 0.5f;
-            float diffX = ball.position.x - brickCenterX;
-            float diffY = ball.position.y - brickCenterY;
-
-            if (std::abs(diffX) > std::abs(diffY)) {
-                ball.velocity.x *= -1.0f;
-                if (diffX > 0.0f) {
-                    ball.position.x = brick.rect.x + brick.rect.width + ball.radius;
-                } else {
-                    ball.position.x = brick.rect.x - ball.radius;
+        if (ball.freezeReady) {
+            if (freezeColorIndex != -1) {
+                int frozenBricks = FreezeConnectedBricks(bricks, brick.row, brick.col, freezeColorIndex);
+                if (frozenBricks > 0) {
+                    ShowReactionMessage(reactionMessage, "Freeze!", BrickPalette[ColorIndexLightBlue]);
                 }
-            } else {
-                ball.velocity.y *= -1.0f;
-                if (diffY > 0.0f) {
-                    ball.position.y = brick.rect.y + brick.rect.height + ball.radius;
+            }
+            ball.freezeReady = false;
+        }
+
+        if (!ball.superconduct) {
+            bool collidedFromLeft = previousPosition.x + ball.radius <= brick.rect.x;
+            bool collidedFromRight = previousPosition.x - ball.radius >= brick.rect.x + brick.rect.width;
+            bool collidedFromTop = previousPosition.y + ball.radius <= brick.rect.y;
+            bool collidedFromBottom = previousPosition.y - ball.radius >= brick.rect.y + brick.rect.height;
+
+            bool resolved = false;
+
+            if (collidedFromLeft || collidedFromRight) {
+                ball.velocity.x *= -1.0f;
+                if (collidedFromLeft) {
+                    ball.position.x = brick.rect.x - ball.radius;
                 } else {
+                    ball.position.x = brick.rect.x + brick.rect.width + ball.radius;
+                }
+                resolved = true;
+            }
+
+            if (!resolved && (collidedFromTop || collidedFromBottom)) {
+                ball.velocity.y *= -1.0f;
+                if (collidedFromTop) {
                     ball.position.y = brick.rect.y - ball.radius;
+                } else {
+                    ball.position.y = brick.rect.y + brick.rect.height + ball.radius;
+                }
+                resolved = true;
+            }
+
+            if (!resolved) {
+                float brickCenterX = brick.rect.x + brick.rect.width * 0.5f;
+                float brickCenterY = brick.rect.y + brick.rect.height * 0.5f;
+                float diffX = ball.position.x - brickCenterX;
+                float diffY = ball.position.y - brickCenterY;
+
+                if (std::abs(diffX) > std::abs(diffY)) {
+                    ball.velocity.x *= -1.0f;
+                    if (diffX > 0.0f) {
+                        ball.position.x = brick.rect.x + brick.rect.width + ball.radius;
+                    } else {
+                        ball.position.x = brick.rect.x - ball.radius;
+                    }
+                } else {
+                    ball.velocity.y *= -1.0f;
+                    if (diffY > 0.0f) {
+                        ball.position.y = brick.rect.y + brick.rect.height + ball.radius;
+                    } else {
+                        ball.position.y = brick.rect.y - ball.radius;
+                    }
                 }
             }
         }
@@ -315,21 +475,64 @@ int HandleBallBrickCollision(Ball& ball, std::vector<Brick>& bricks, Vector2 pre
                               (brick.colorIndex != ColorIndexGreen) &&
                               (brick.colorIndex != -1);
 
+        bool overloadTriggered = ball.overloaded;
+        bool instantBreak = triggeredSwirl || overloadTriggered;
+        bool destroyedThisHit = false;
+
+        if (brick.frozen) {
+            if (ball.colorIndex == ColorIndexRed) {
+                brick.frozen = false;
+                brick.baseColor = {255, 221, 0, 255};
+                brick.color = brick.baseColor;
+                brick.colorIndex = -1;
+                brick.hitPoints = 1;
+                brick.cracked = false;
+            } else {
+                instantBreak = true;
+            }
+        }
+
+        if (instantBreak) {
+            brick.active = false;
+            brick.hitPoints = 0;
+            brick.cracked = false;
+            brick.color = brick.baseColor;
+            destroyedThisHit = true;
+            brick.frozen = false;
+        } else {
+            brick.hitPoints -= 1;
+            if (brick.hitPoints <= 0) {
+                brick.active = false;
+                brick.hitPoints = 0;
+                destroyedThisHit = true;
+                brick.frozen = false;
+            } else {
+                brick.cracked = true;
+                brick.color = LightenColor(brick.baseColor, 0.45f);
+            }
+        }
+
         if (triggeredSwirl) {
             overloadEvents.push_back(OverloadEvent{
                 .row = brick.row,
                 .col = brick.col,
                 .timer = OverloadAoEDelay,
             });
+            ShowReactionMessage(reactionMessage, "Swirl!", BrickPalette[ColorIndexGreen]);
         }
 
-        if (ball.overloaded) {
+        if (overloadTriggered) {
             overloadEvents.push_back(OverloadEvent{
                 .row = brick.row,
                 .col = brick.col,
                 .timer = OverloadAoEDelay,
             });
+            ShowReactionMessage(reactionMessage, "Overloaded!", BrickPalette[ColorIndexRed]);
             ball.overloaded = false;
+        }
+
+        if (destroyedThisHit) {
+            bricksBroken += 1;
         }
 
         break;
@@ -371,6 +574,7 @@ int main() {
 
     std::vector<Brick> bricks = CreateBricks();
     std::vector<OverloadEvent> overloadEvents;
+    ReactionMessage reactionMessage;
 
     int score = 0;
     int lives = 3;
@@ -385,10 +589,28 @@ int main() {
             paused = !paused;
         }
 
-
         if (!paused && !gameOver && !gameWon) {
             UpdatePaddle(paddle, dt);
             HandlePaddleColorInput(paddle);
+        }
+
+        if (!paused) {
+            UpdateReactionMessage(reactionMessage, dt);
+            if (ball.inPlay && ball.frozen) {
+                ball.freezeTimer -= dt;
+                ball.position.x = paddle.rect.x + paddle.rect.width * 0.5f;
+                ball.position.y = paddle.rect.y - ball.radius - 1.0f;
+                if (ball.freezeTimer <= 0.0f) {
+                    ball.frozen = false;
+                    float storedSpeed = std::sqrt(ball.storedVelocity.x * ball.storedVelocity.x + ball.storedVelocity.y * ball.storedVelocity.y);
+                    if (storedSpeed <= 0.001f) {
+                        ball.velocity = {0.0f, -ball.speed};
+                    } else {
+                        ball.velocity = ball.storedVelocity;
+                    }
+                    ball.storedVelocity = {};
+                }
+            }
         }
 
         if (!ball.inPlay) {
@@ -406,7 +628,7 @@ int main() {
             ball.inPlay = false;
         }
 
-        if (!paused && ball.inPlay && !gameOver && !gameWon) {
+        if (!paused && ball.inPlay && !gameOver && !gameWon && !ball.frozen) {
             Vector2 previousPosition = ball.position;
             ball.position = {
                 ball.position.x + ball.velocity.x * dt,
@@ -414,8 +636,19 @@ int main() {
             };
 
             HandleBallWallCollisions(ball);
-            HandleBallPaddleCollision(ball, paddle);
-            score += HandleBallBrickCollision(ball, bricks, previousPosition, overloadEvents);
+            bool hitPaddle = HandleBallPaddleCollision(ball, paddle);
+            if (hitPaddle) {
+                if (ball.overloaded) {
+                    ShowReactionMessage(reactionMessage, "Overloaded!", BrickPalette[ColorIndexRed]);
+                }
+                if (ball.superconduct) {
+                    ShowReactionMessage(reactionMessage, "Superconduct!", BrickPalette[ColorIndexLightBlue]);
+                }
+                 if (ball.frozen) {
+                     ShowReactionMessage(reactionMessage, "Freeze!", BrickPalette[ColorIndexLightBlue]);
+                 }
+            }
+            score += HandleBallBrickCollision(ball, bricks, previousPosition, overloadEvents, reactionMessage);
 
             int activeBricks = CountActiveBricks(bricks);
 
@@ -461,7 +694,13 @@ int main() {
 
         for (const Brick& brick : bricks) {
             if (brick.active) {
-                DrawRectangleRec(brick.rect, brick.color);
+                Color drawColor = brick.cracked ? brick.color : brick.baseColor;
+                DrawRectangleRec(brick.rect, drawColor);
+                if (brick.cracked) {
+                    DrawRectangleLinesEx(brick.rect, 2.0f, Fade(WHITE, 0.6f));
+                } else if (brick.frozen) {
+                    DrawRectangleLinesEx(brick.rect, 2.0f, Fade(BLUE, 0.5f));
+                }
             }
         }
 
@@ -473,6 +712,12 @@ int main() {
         const char* controlsText = "Left/Right or A/D to move, P to pause, Q to quit, 1-5 to change paddle color";
         int controlsWidth = MeasureText(controlsText, 20);
         DrawText(controlsText, ScreenWidth / 2 - controlsWidth / 2, ScreenHeight - 32, 20, GRAY);
+
+        if (reactionMessage.active) {
+            int fontSize = 32;
+            int textWidth = MeasureText(reactionMessage.text.c_str(), fontSize);
+            DrawText(reactionMessage.text.c_str(), ScreenWidth / 2 - textWidth / 2, ScreenHeight - 200, fontSize, reactionMessage.color);
+        }
         if (paused && !gameOver && !gameWon) {
             DrawText("Paused - Press P to resume", ScreenWidth / 2 - 170, ScreenHeight / 2, 24, SKYBLUE);
         }
